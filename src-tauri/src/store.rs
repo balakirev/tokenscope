@@ -31,12 +31,39 @@ pub struct RawEvent {
     // own stale events before being re-read, so re-ingestion stays idempotent.
     #[serde(default)]
     pub source: String,
+    // ── Keeper attribution facts (v5) ──
+    // Every tool_use name in this message (built-ins like Edit/Bash and full
+    // mcp__<server>__<tool> names), unfiltered. One entry per call.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    // Subagent type when the line came from a subagent transcript
+    // (`<session>/subagents/agent-<id>.jsonl` + its .meta.json), else empty.
+    #[serde(default)]
+    pub agent: String,
+    // promptId of the user turn this message belongs to (assistant lines don't
+    // carry it, so it's inherited from the last user line in the same file).
+    #[serde(default)]
+    pub turn: String,
+}
+
+/// Per-session facts for the "hot sessions" list (cwd + title).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SessionInfo {
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub custom_title: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
     // path -> (size, mtime_ms, byte offset already ingested)
     files: HashMap<String, (u64, i64, u64)>,
+    // path -> last promptId seen (turn context carried across incremental reads)
+    #[serde(default)]
+    turns: HashMap<String, String>,
 }
 
 pub struct Store {
@@ -47,6 +74,7 @@ pub struct Store {
     // count its token usage only once.
     index: HashMap<String, usize>,
     manifest: Manifest,
+    pub sessions: HashMap<String, SessionInfo>,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -56,7 +84,8 @@ pub struct Store {
 //   v3: merge tool_use across lines sharing a message id (a thinking line + a
 //       tool_use line were deduped, dropping the tool call).
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
-const STORE_VERSION: u32 = 4;
+//   v5: keeper facts — every tool name, subagent type, turn (promptId), sessions.
+const STORE_VERSION: u32 = 5;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -82,6 +111,7 @@ impl Store {
     pub fn load() -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
+        let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
         if let Some(dir) = cache_dir() {
             // If the cache was written by an older parser, discard it so ingest
             // does a full rescan and picks up newly-extracted facts.
@@ -106,6 +136,10 @@ impl Store {
                 if let (Some(e), Some(m)) = (loaded_events, loaded_manifest) {
                     events = e;
                     manifest = m;
+                    sessions = fs::read_to_string(dir.join("sessions.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str(&t).ok())
+                        .unwrap_or_default();
                 }
             }
         }
@@ -119,6 +153,7 @@ impl Store {
             events,
             index,
             manifest,
+            sessions,
         }
     }
 
@@ -131,6 +166,9 @@ impl Store {
             // than ahead of the events on disk.
             if let Ok(t) = serde_json::to_string(&self.events) {
                 let _ = write_atomic(&dir.join("events.json"), t.as_bytes());
+            }
+            if let Ok(t) = serde_json::to_string(&self.sessions) {
+                let _ = write_atomic(&dir.join("sessions.json"), t.as_bytes());
             }
             if let Ok(t) = serde_json::to_string(&self.manifest) {
                 let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
@@ -230,13 +268,31 @@ impl Store {
                 Some(i) => i + 1,
                 None => 0,
             };
+            let agent = subagent_type(path);
+            let mut cur_turn = self.manifest.turns.get(&key).cloned().unwrap_or_default();
             for line in buf[..process_until].split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
                 let Ok(s) = std::str::from_utf8(line) else { continue };
-                if let Some(mut ev) = parse_line(s) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { continue };
+                self.note_session(&v);
+                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ty == "user" {
+                    if let Some(p) = v.get("promptId").and_then(|p| p.as_str()) {
+                        cur_turn = p.to_string();
+                    }
+                }
+                if let Some(mut ev) = parse_value(&v) {
                     ev.source = key.clone();
+                    ev.turn = cur_turn.clone();
+                    ev.agent = if !agent.is_empty() {
+                        agent.clone()
+                    } else if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+                        "subagent".to_string()
+                    } else {
+                        String::new()
+                    };
                     if !ev.id.is_empty() {
                         if let Some(&i) = self.index.get(&ev.id) {
                             // Same message, another line: merge its tool calls
@@ -244,12 +300,16 @@ impl Store {
                             let prev = &mut self.events[i];
                             prev.mcp.extend(ev.mcp);
                             prev.skills.extend(ev.skills);
+                            prev.tools.extend(ev.tools);
                             continue;
                         }
                         self.index.insert(ev.id.clone(), self.events.len());
                     }
                     self.events.push(ev);
                 }
+            }
+            if !cur_turn.is_empty() {
+                self.manifest.turns.insert(key.clone(), cur_turn);
             }
             offset += process_until as u64;
             self.manifest.files.insert(key, (size, mtime_ms, offset));
@@ -259,9 +319,60 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Remember cwd / title per session (ai-title, custom-title lines).
+    fn note_session(&mut self, v: &serde_json::Value) {
+        let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) else { return };
+        if sid.is_empty() {
+            return;
+        }
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let info = self.sessions.entry(sid.to_string()).or_default();
+        if info.cwd.is_empty() {
+            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                info.cwd = c.to_string();
+            }
+        }
+        if ty == "custom-title" {
+            if let Some(t) = v.get("customTitle").and_then(|t| t.as_str()) {
+                info.title = t.to_string();
+                info.custom_title = true;
+            }
+        } else if ty == "ai-title" && !info.custom_title {
+            if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
+                info.title = t.to_string();
+            }
+        }
+    }
+}
+
+/// For `<session>/subagents/agent-<id>.jsonl`, read the sibling
+/// `agent-<id>.meta.json` → agentType ("general-purpose", "Explore", …).
+fn subagent_type(path: &std::path::Path) -> String {
+    let in_sub = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n == "subagents")
+        .unwrap_or(false);
+    if !in_sub {
+        return String::new();
+    }
+    let meta = path.with_extension("meta.json");
+    fs::read_to_string(meta)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("agentType").and_then(|a| a.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "subagent".to_string())
+}
+
 /// Parse one JSONL line into a RawEvent (assistant messages only).
+#[allow(dead_code)]
 fn parse_line(line: &str) -> Option<RawEvent> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    parse_value(&v)
+}
+
+fn parse_value(v: &serde_json::Value) -> Option<RawEvent> {
     match v.get("type")?.as_str()? {
         "assistant" => parse_assistant(&v),
         // Skills invoked via slash command (e.g. `/find-skills`) are logged as a
@@ -316,6 +427,9 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         skills: vec![skill],
         id,
         source: String::new(),
+        tools: Vec::new(),
+        agent: String::new(),
+        turn: String::new(),
     })
 }
 
@@ -348,12 +462,16 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
 
     let mut mcp = Vec::new();
     let mut skills = Vec::new();
+    let mut tools = Vec::new();
     if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                 continue;
             }
             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                tools.push(name.to_string());
+            }
             if let Some(rest) = name.strip_prefix("mcp__") {
                 mcp.push(rest.split("__").next().unwrap_or("").to_string());
             } else if name == "Skill" {
@@ -382,5 +500,8 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         skills,
         id,
         source: String::new(),
+        tools,
+        agent: String::new(),
+        turn: String::new(),
     })
 }

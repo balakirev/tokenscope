@@ -13,9 +13,35 @@ export interface PeriodReport {
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
+export type ItemKind = "skill" | "agent" | "tool" | "mcp" | "command";
+export interface KeeperItem { name: string; kind: ItemKind; tokens: number; cost: number; count: number; lastMs: number }
+export interface KeeperWindow {
+  key: "5h" | "24h" | "week" | "month"; totalTokens: number; totalCost: number;
+  requests: number; sessions: number; bars: number[]; barLabels: string[]; items: KeeperItem[];
+}
+export interface HotSession {
+  session: string; project: string; cwd: string; title: string; context: number;
+  tokens5h: number; cost5h: number; lastMs: number; hot: boolean; reason: string;
+}
+export interface Keeper {
+  windows: KeeperWindow[]; sessions: HotSession[]; alert: boolean;
+  lastUsed: Record<string, number>; runs30d: Record<string, number>;
+}
+export interface InvItem {
+  name: string; description: string; kind: "skill" | "agent" | "command"; scope: "user" | "plugin";
+  plugin: string; enabled: boolean; file: string; root: string; editable: boolean; descLen: number; warnings: string[];
+}
 export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
+  keeper?: Keeper;
+}
+
+export const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export async function fetchInventory(): Promise<InvItem[]> {
+  if (inTauri()) return invoke<InvItem[]>("get_inventory");
+  const res = await fetch("/dev-inventory.json").catch(() => null);
+  return res && res.ok ? res.json() : [];
 }
 
 export async function fetchDashboard(): Promise<Dashboard> {

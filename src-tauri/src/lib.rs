@@ -1,7 +1,9 @@
 mod config;
+mod keeper;
 mod model;
 mod parser;
 mod pricing;
+mod skills;
 mod store;
 
 use model::Dashboard;
@@ -39,7 +41,7 @@ fn now_ms() -> i64 {
 fn refresh(app: &tauri::AppHandle) {
     let dash = parser::build_dashboard();
     if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
+        let label = tray_label(&dash);
         // macOS shows the label next to the menu-bar icon (set_title). Windows'
         // taskbar tray has no equivalent — set_title is a no-op there — so we
         // surface the same number through the hover tooltip instead, the only
@@ -660,6 +662,39 @@ fn show_popover(app: &tauri::AppHandle) {
     }
 }
 
+/// Tray text: today's tokens, prefixed with a warning sign while a live
+/// session is expensive (big context or heavy 5h burn).
+fn tray_label(dash: &Dashboard) -> String {
+    let base = fmt_tokens_m(dash.today_tokens);
+    if dash.keeper.alert {
+        format!("⚠ {}", base)
+    } else {
+        base
+    }
+}
+
+#[tauri::command]
+async fn get_inventory() -> Vec<skills::InvItem> {
+    tauri::async_runtime::spawn_blocking(skills::inventory)
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn toggle_item(root: String, kind: String, enable: bool) -> Result<String, String> {
+    skills::set_enabled(&root, &kind, enable)
+}
+
+#[tauri::command]
+fn open_item(path: String, reveal: bool) -> Result<(), String> {
+    skills::open_path(&path, reveal)
+}
+
+#[tauri::command]
+fn set_item_description(file: String, text: String) -> Result<(), String> {
+    skills::set_description(&file, &text)
+}
+
 #[tauri::command]
 async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // build_dashboard does blocking IO (reads/writes the cache, parses logs) and
@@ -673,7 +708,7 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // instant it opens, while the tray otherwise only refreshes every 30s — so
     // without this the two could disagree for up to 30s during heavy usage.
     if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
+        let label = tray_label(&dash);
         let _ = tray.set_title(Some(label.clone()));
         // Mirror refresh(): keep the tooltip in sync for Windows, where the
         // title isn't shown next to the icon.
@@ -791,6 +826,10 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            get_inventory,
+            toggle_item,
+            open_item,
+            set_item_description,
             save_screenshot,
             begin_drag,
             refresh_pricing,
@@ -923,7 +962,7 @@ pub fn run() {
 
             // Build the menu-bar tray: app glyph (template icon) + today's tokens.
             let dash = parser::build_dashboard();
-            let label = fmt_tokens_m(dash.today_tokens);
+            let label = tray_label(&dash);
 
             let open_i = MenuItem::with_id(app, "open", "Open Tokenscope", true, None::<&str>)?;
             let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;

@@ -81,4 +81,5 @@ pub struct Dashboard {
     pub today_tokens: f64, // M tokens, for the tray label
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
+    pub keeper: crate::keeper::Keeper,
 }

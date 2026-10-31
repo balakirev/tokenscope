@@ -7,6 +7,7 @@ import {
   Dashboard, PeriodReport, ModelStat, Theme, TH,
   fetchDashboard, fmtInt, fmtTokens, pct,
 } from "./data";
+import { KeeperShell, KTab } from "./Keeper";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
 } from "./charts";
@@ -278,7 +279,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
 
   return (
     <div style={{
-      width: "100%", height: "100vh", overflow: "hidden", boxSizing: "border-box",
+      width: "100%", height: "100%", overflow: "hidden", boxSizing: "border-box",
       position: "relative",
       background: "transparent", padding: 0,
       fontFamily: t.ui,
@@ -304,8 +305,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         onMouseUp={canDrag ? () => { dragRef.current = null; } : undefined}
         style={{
         width: "100%", height: "100%", overflowY: "auto",
-        borderRadius: 12, background: dark ? "#1f2226" : "#ffffff",
-        border: `1px solid ${dark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)"}`,
+        borderRadius: 0, background: dark ? "#1f2226" : "#ffffff",
+        border: "none",
         padding: 0, color: t.text, cursor: canDrag ? "grab" : undefined,
       }}>
         {/* sticky header — stays put while the body scrolls */}
@@ -436,6 +437,17 @@ export default function App() {
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [openGen, setOpenGen] = useState(0);
+  const [tab, setTab] = useState<KTab>(() => {
+    try {
+      const v = localStorage.getItem("kp-tab");
+      if (v === "usage" || v === "skills" || v === "sessions" || v === "charts") return v;
+    } catch {}
+    return "usage";
+  });
+  const setTabPersist = (t: KTab) => {
+    setTab(t);
+    try { localStorage.setItem("kp-tab", t); } catch {}
+  };
   const [focused, setFocused] = useState(true); // browser preview: always "focused"
   // Theme preference: explicit Dark / Light, or System (follows the OS
   // appearance live on both macOS and Windows via prefers-color-scheme). First
@@ -553,5 +565,9 @@ export default function App() {
       </div>
     );
   }
-  return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme} openGen={openGen} active={focused} />;
+  return (
+    <KeeperShell dash={dash} dark={dark} tab={tab} setTab={setTabPersist} openGen={openGen}>
+      <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme} openGen={openGen} active={focused} />
+    </KeeperShell>
+  );
 }

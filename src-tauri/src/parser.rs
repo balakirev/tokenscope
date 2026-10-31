@@ -38,7 +38,7 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-fn normalize_model(name: &str) -> String {
+pub(crate) fn normalize_model(name: &str) -> String {
     if let Some(idx) = name.rfind('-') {
         let suffix = &name[idx + 1..];
         if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -99,6 +99,14 @@ pub fn build_dashboard() -> Dashboard {
     let now = Local::now();
     let today = now.date_naive();
 
+    // Keeper view (per skill/agent/tool attribution) works on the raw events.
+    let user_commands: HashSet<String> = crate::skills::inventory()
+        .into_iter()
+        .filter(|i| i.kind == "command")
+        .map(|i| i.name)
+        .collect();
+    let keeper = crate::keeper::build(&store.events, &pricing, &store.sessions, &user_commands);
+
     let mut day = report_day(&events, now);
     let mut week = report_week(&events, now);
     let mut month = report_month(&events, now);
@@ -127,6 +135,7 @@ pub fn build_dashboard() -> Dashboard {
         heatmap,
         today_tokens,
         generated_at: now.to_rfc3339(),
+        keeper,
     }
 }
 
