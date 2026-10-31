@@ -76,6 +76,8 @@ pub struct Dashboard {
     pub day: PeriodReport,
     pub week: PeriodReport,
     pub month: PeriodReport,
+    /// Everything stored: raw events + permanent daily rollups.
+    pub all: PeriodReport,
     pub heatmap: Vec<HeatDay>,
     #[serde(rename = "todayTokens")]
     pub today_tokens: f64, // M tokens, for the tray label

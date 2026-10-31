@@ -33,7 +33,7 @@ export interface InvItem {
   plugin: string; enabled: boolean; file: string; root: string; editable: boolean; descLen: number; warnings: string[]; account: string;
 }
 export interface Dashboard {
-  day: PeriodReport; week: PeriodReport; month: PeriodReport;
+  day: PeriodReport; week: PeriodReport; month: PeriodReport; all?: PeriodReport;
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
   keeper?: Keeper;
   accounts?: AccountView[];

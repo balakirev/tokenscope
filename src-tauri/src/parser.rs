@@ -17,8 +17,9 @@ static BUILD_LOCK: Mutex<()> = Mutex::new(());
 // from a RawEvent, since user config / prices / time windows can all change).
 struct Event {
     ts: DateTime<Local>,
-    session: String,
+    sessions: Vec<String>,
     model: String,
+    reqs: f64, // LLM requests this event stands for (1 per message; n for a rollup day)
     input: f64,  // raw tokens, uncached new input only
     cache: f64,  // raw tokens, cache creation + read
     output: f64, // raw tokens
@@ -76,8 +77,9 @@ pub fn build_dashboard() -> Dashboard {
     //    the entire events.json every 30s.
     let mut store = Store::load();
     let mut dirty = store.ingest();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    // Raw events: 62 days (Day/Week/Month + previous month, keeper's 30d).
+    // Older ones are folded into per-day rollups that are kept forever.
+    let cutoff = (Local::now() - Duration::days(62)).timestamp_millis();
     if store.prune_before(cutoff) {
         dirty = true;
     }
@@ -90,11 +92,12 @@ pub fn build_dashboard() -> Dashboard {
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
-    let events: Vec<Event> = store
+    let mut events: Vec<Event> = store
         .events
         .iter()
         .map(|r| compute_event(r, &cfg, &pricing))
         .collect();
+    events.extend(store.rollup.days.iter().filter_map(|d| roll_event(d, &cfg, &pricing)));
 
     let now = Local::now();
     let today = now.date_naive();
@@ -125,13 +128,14 @@ pub fn build_dashboard() -> Dashboard {
     let mut day = report_day(&events, now);
     let mut week = report_week(&events, now);
     let mut month = report_month(&events, now);
+    let mut all = report_all(&events, now);
     let heatmap = build_heatmap(&events, today);
 
     // "servers"/"skills" = how many the user has *installed* (global, constant
     // across periods), not how many were called in the window.
     let installed_servers = cfg.mcp_servers.len() as u64;
     let installed_skills = cfg.skills.len() as u64;
-    for r in [&mut day, &mut week, &mut month] {
+    for r in [&mut day, &mut week, &mut month, &mut all] {
         r.metrics.servers = installed_servers;
         r.metrics.skills = installed_skills;
     }
@@ -147,6 +151,7 @@ pub fn build_dashboard() -> Dashboard {
         day,
         week,
         month,
+        all,
         heatmap,
         today_tokens,
         generated_at: now.to_rfc3339(),
@@ -181,7 +186,8 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .collect();
     Event {
         ts,
-        session: r.session.clone(),
+        sessions: if r.session.is_empty() { vec![] } else { vec![r.session.clone()] },
+        reqs: if model.is_empty() { 0.0 } else { 1.0 },
         model,
         input: r.in_tok,
         cache: r.cc + r.cr,
@@ -191,6 +197,46 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         mcp,
         skills,
     }
+}
+
+/// A rolled-up day × model as one Event (timestamped at local noon).
+fn roll_event(d: &crate::store::DayRoll, cfg: &UserConfig, pricing: &Pricing) -> Option<Event> {
+    use chrono::{NaiveDate, TimeZone};
+    let date = NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok()?;
+    let ts = Local.from_local_datetime(&date.and_hms_opt(12, 0, 0)?).single()?;
+    let model = normalize_model(&d.model);
+    let cost_opt = if d.model.is_empty() {
+        None
+    } else {
+        pricing
+            .cost(&d.model, d.in_tok, d.out_tok, d.cc, d.cr)
+            .or_else(|| pricing.cost(&model, d.in_tok, d.out_tok, d.cc, d.cr))
+    };
+    let expand = |m: &std::collections::HashMap<String, u64>, keep: &dyn Fn(&str) -> bool, short: bool| -> Vec<String> {
+        let mut v = Vec::new();
+        for (k, n) in m {
+            if keep(k) {
+                let name = if short { k.rsplit(':').next().unwrap_or(k).to_string() } else { k.clone() };
+                for _ in 0..*n {
+                    v.push(name.clone());
+                }
+            }
+        }
+        v
+    };
+    Some(Event {
+        ts,
+        sessions: d.sessions.clone(),
+        reqs: d.requests as f64,
+        model,
+        input: d.in_tok,
+        cache: d.cc + d.cr,
+        output: d.out_tok,
+        cost: cost_opt.unwrap_or(0.0),
+        priced: cost_opt.is_some(),
+        mcp: expand(&d.mcp, &|s| cfg.is_user_mcp(s), false),
+        skills: expand(&d.skills, &|s| cfg.is_user_skill(s), true),
+    })
 }
 
 // ── aggregation helpers ────────────────────────────────────────────
@@ -217,13 +263,13 @@ impl Agg {
         self.cache += e.cache;
         self.output += e.output;
         self.cost += e.cost;
-        if !e.session.is_empty() {
-            self.sessions.insert(e.session.clone());
+        for s in &e.sessions {
+            self.sessions.insert(s.clone());
         }
         // Slash-command skill events carry no model (empty) — they're not LLM
         // requests, so they must not inflate request counts or the model split.
         if !e.model.is_empty() {
-            self.requests += 1;
+            self.requests += e.reqs as u64;
             // model totals keep all token types so shares sum to Total tokens
             *self.model_tok.entry(e.model.clone()).or_default() += e.input + e.cache + e.output;
             *self.model_cost.entry(e.model.clone()).or_default() += e.cost;
@@ -325,7 +371,7 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             // (slash-command) events; total cost accumulates unconditionally
             // (those events carry cost 0, so this is identical today).
             if !e.model.is_empty() {
-                req_b[h] += 1.0;
+                req_b[h] += e.reqs;
             }
             cost_b[h] += e.cost;
         } else if d == yesterday {
@@ -391,7 +437,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 // Match Agg::add: only the request COUNT excludes model-less
                 // events; cost accumulates unconditionally (their cost is 0).
                 if !e.model.is_empty() {
-                    req_b[idx] += 1.0;
+                    req_b[idx] += e.reqs;
                 }
                 cost_b[idx] += e.cost;
             }
@@ -465,7 +511,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 // Match Agg::add: only the request COUNT excludes model-less
                 // events; cost accumulates unconditionally (their cost is 0).
                 if !e.model.is_empty() {
-                    req_b[idx] += 1.0;
+                    req_b[idx] += e.reqs;
                 }
                 cost_b[idx] += e.cost;
             }
@@ -500,6 +546,100 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             ),
             pct_delta(agg.cost, prev.cost),
         ),
+        series,
+        models: agg.models(),
+        mcp: Agg::named(&agg.mcp_counts),
+        skills: Agg::named(&agg.skill_counts),
+        req_trend: req_b,
+        cost_trend: cost_b,
+    }
+}
+
+// ── All time: everything stored (raw + rollups) ──────────────────
+// Daily bars while history is short, weekly up to ~6 months, monthly after.
+fn report_all(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+    use chrono::NaiveDate;
+    let today = now.date_naive();
+    let first = events.iter().map(|e| e.ts.date_naive()).min().unwrap_or(today);
+    let span = (today - first).num_days().max(0) + 1;
+    // bucket start dates
+    let mut starts: Vec<NaiveDate> = Vec::new();
+    let mode = if span <= 62 { 0 } else if span <= 190 { 1 } else { 2 };
+    match mode {
+        0 => {
+            let mut d = first;
+            while d <= today {
+                starts.push(d);
+                d += Duration::days(1);
+            }
+        }
+        1 => {
+            let mut d = first - Duration::days(first.weekday().num_days_from_monday() as i64);
+            while d <= today {
+                starts.push(d);
+                d += Duration::days(7);
+            }
+        }
+        _ => {
+            let (mut y, mut m) = (first.year(), first.month());
+            loop {
+                let d = NaiveDate::from_ymd_opt(y, m, 1).unwrap();
+                if d > today {
+                    break;
+                }
+                starts.push(d);
+                if m == 12 {
+                    y += 1;
+                    m = 1;
+                } else {
+                    m += 1;
+                }
+            }
+        }
+    }
+    let n = starts.len().max(1);
+    let mut agg = Agg::default();
+    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); n];
+    let mut req_b = vec![0.0f64; n];
+    let mut cost_b = vec![0.0f64; n];
+    for e in events {
+        let d = e.ts.date_naive();
+        if d > today {
+            continue;
+        }
+        agg.add(e);
+        let idx = match starts.binary_search(&d) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+        .min(n - 1);
+        buckets[idx].0 += e.input / 1e6;
+        buckets[idx].1 += e.cache / 1e6;
+        buckets[idx].2 += e.output / 1e6;
+        req_b[idx] += e.reqs;
+        cost_b[idx] += e.cost;
+    }
+    let every = (n / 6).max(1);
+    let series = (0..n)
+        .map(|i| {
+            let d = starts.get(i).copied().unwrap_or(today);
+            let mon = MONTHS[(d.month() - 1) as usize];
+            let (label, full) = match mode {
+                0 => (format!("{}", d.day()), format!("{} {}", mon, d.day())),
+                1 => (format!("{} {}", mon, d.day()), format!("Week of {} {}", mon, d.day())),
+                _ => (mon.to_string(), format!("{} {}", mon, d.year())),
+            };
+            SeriesPoint {
+                label: if i % every == 0 { label } else { String::new() },
+                full,
+                input: buckets[i].0,
+                cache: buckets[i].1,
+                output: buckets[i].2,
+            }
+        })
+        .collect();
+    PeriodReport {
+        metrics: agg.metrics(0.0, 0.0),
         series,
         models: agg.models(),
         mcp: Agg::named(&agg.mcp_counts),

@@ -49,6 +49,33 @@ pub struct RawEvent {
     pub acct: String,
 }
 
+/// One day × model of usage that's older than the raw-event window, kept
+/// forever so "All time" survives Claude Code deleting its old logs (default
+/// after 30 days) without events.json growing without bound.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct DayRoll {
+    pub date: String, // local YYYY-MM-DD
+    pub model: String,
+    pub in_tok: f64,
+    pub cc: f64,
+    pub cr: f64,
+    pub out_tok: f64,
+    pub requests: u64,
+    pub sessions: Vec<String>,
+    pub mcp: HashMap<String, u64>,
+    pub skills: HashMap<String, u64>,
+}
+
+/// Lives in rollup.json, independent of STORE_VERSION: a parser upgrade wipes
+/// and rescans events, but rolled-up history can't be rebuilt from deleted logs.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Rollup {
+    /// events older than this were folded into `days`; ingest skips them so a
+    /// rescan never double counts.
+    pub until_ms: i64,
+    pub days: Vec<DayRoll>,
+}
+
 /// Per-session facts for the "hot sessions" list (cwd + title).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct SessionInfo {
@@ -80,6 +107,7 @@ pub struct Store {
     index: HashMap<String, usize>,
     manifest: Manifest,
     pub sessions: HashMap<String, SessionInfo>,
+    pub rollup: Rollup,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -156,6 +184,10 @@ impl Store {
                 }
             }
         }
+        let rollup: Rollup = cache_dir()
+            .and_then(|d| fs::read_to_string(d.join("rollup.json")).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         let index = events
             .iter()
             .enumerate()
@@ -167,6 +199,7 @@ impl Store {
             index,
             manifest,
             sessions,
+            rollup,
         }
     }
 
@@ -185,6 +218,9 @@ impl Store {
             }
             if let Ok(t) = serde_json::to_string(&self.manifest) {
                 let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
+            }
+            if let Ok(t) = serde_json::to_string(&self.rollup) {
+                let _ = write_atomic(&dir.join("rollup.json"), t.as_bytes());
             }
             let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
         }
@@ -216,6 +252,47 @@ impl Store {
     /// bound. Returns whether anything was removed. Old logs already at EOF are
     /// never re-read, so their pruned events don't reappear.
     pub fn prune_before(&mut self, cutoff_ms: i64) -> bool {
+        // Fold everything older than the cutoff into per-day rollups first.
+        let mut map: HashMap<(String, String), DayRoll> = self
+            .rollup
+            .days
+            .drain(..)
+            .map(|d| ((d.date.clone(), d.model.clone()), d))
+            .collect();
+        let mut folded = false;
+        for e in self.events.iter().filter(|e| e.ts_ms < cutoff_ms) {
+            folded = true;
+            let date = chrono::DateTime::from_timestamp_millis(e.ts_ms)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            let r = map.entry((date.clone(), e.model.clone())).or_insert_with(|| DayRoll {
+                date,
+                model: e.model.clone(),
+                ..Default::default()
+            });
+            r.in_tok += e.in_tok;
+            r.cc += e.cc;
+            r.cr += e.cr;
+            r.out_tok += e.out_tok;
+            if !e.model.is_empty() {
+                r.requests += 1;
+            }
+            if !e.session.is_empty() && !r.sessions.contains(&e.session) {
+                r.sessions.push(e.session.clone());
+            }
+            for m in &e.mcp {
+                *r.mcp.entry(m.clone()).or_default() += 1;
+            }
+            for k in &e.skills {
+                *r.skills.entry(k.clone()).or_default() += 1;
+            }
+        }
+        let mut days: Vec<DayRoll> = map.into_values().collect();
+        days.sort_by(|a, b| a.date.cmp(&b.date).then(a.model.cmp(&b.model)));
+        self.rollup.days = days;
+        if folded {
+            self.rollup.until_ms = self.rollup.until_ms.max(cutoff_ms);
+        }
         let before = self.events.len();
         self.events.retain(|e| e.ts_ms >= cutoff_ms);
         let removed = self.events.len() != before;
@@ -300,7 +377,7 @@ impl Store {
                         cur_turn = p.to_string();
                     }
                 }
-                if let Some(mut ev) = parse_value(&v) {
+                if let Some(mut ev) = parse_value(&v).filter(|e| e.ts_ms >= self.rollup.until_ms) {
                     ev.source = key.clone();
                     ev.turn = cur_turn.clone();
                     ev.acct = acct.clone();

@@ -198,8 +198,11 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   // / dismisses and never arms the hide-suppression guard.
   const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
-  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
-  const P: PeriodReport = period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+  const [period, setPeriod] = useState<"Day" | "Week" | "Month" | "All">(() => {
+    try { const v = localStorage.getItem("ts-period"); if (v === "Day" || v === "Week" || v === "Month" || v === "All") return v; } catch {}
+    return "Week";
+  });
+  const P: PeriodReport = period === "Day" ? dash.day : period === "Month" ? dash.month : period === "All" ? (dash.all ?? dash.month) : dash.week;
   const M = P.metrics;
   // animated Total tokens: counts up from 0 on each open / period switch;
   // held at 0 while the popover is hidden so it never flashes the final value.
@@ -229,7 +232,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
   // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
   const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
-  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month", All: "all time" }[period];
 
   // screenshot capture: rasterize the full panel card to a PNG and hand it to
   // the Rust `save_screenshot` command (browser preview falls back to a download).
@@ -322,7 +325,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
-            <Segmented value={period} theme={t} onSelect={(v) => setPeriod(v as any)} />
+            <Segmented value={period} items={["Day", "Week", "Month", "All"]} theme={t}
+              onSelect={(v) => { setPeriod(v as any); try { localStorage.setItem("ts-period", v); } catch {} }} />
             <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
             <ScreenshotButton theme={t} busy={shotBusy} onClick={captureScreenshot} />
           </div>
