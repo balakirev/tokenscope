@@ -82,4 +82,7 @@ pub struct Dashboard {
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
     pub keeper: crate::keeper::Keeper,
+    /// One entry per account; `keeper` is empty when there's only one account
+    /// (the top-level `keeper` already is that account).
+    pub accounts: Vec<crate::keeper::AccountView>,
 }

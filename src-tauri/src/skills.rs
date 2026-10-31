@@ -33,10 +33,12 @@ pub struct InvItem {
     #[serde(rename = "descLen")]
     pub desc_len: usize,
     pub warnings: Vec<String>,
+    /// account config dir this item belongs to
+    pub account: String,
 }
 
-fn claude_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude"))
+fn account_dirs() -> Vec<PathBuf> {
+    crate::accounts::accounts().into_iter().map(|a| PathBuf::from(a.dir)).collect()
 }
 
 /// Minimal YAML-frontmatter reader: top-level `key: value` pairs, with quoted
@@ -115,6 +117,7 @@ fn read_item(file: &Path, root: &Path, kind: &str, scope: &str, plugin: &str, en
         root: root.to_string_lossy().into(),
         editable: scope == "user",
         warnings: Vec::new(),
+        account: String::new(),
     })
 }
 
@@ -177,15 +180,27 @@ fn scan_plugins(base: &Path, out: &mut Vec<InvItem>) {
 }
 
 pub fn inventory() -> Vec<InvItem> {
+    let mut all = Vec::new();
+    for base in account_dirs() {
+        let mut out = inventory_of(&base);
+        let acct = base.to_string_lossy().to_string();
+        for it in out.iter_mut() {
+            it.account = acct.clone();
+        }
+        all.extend(out);
+    }
+    all
+}
+
+fn inventory_of(base: &Path) -> Vec<InvItem> {
     let mut out = Vec::new();
-    let Some(base) = claude_dir() else { return out };
     scan_skill_dirs(&base.join("skills"), true, &mut out);
     scan_skill_dirs(&base.join("skills.paused"), false, &mut out);
     scan_md_files(&base.join("agents"), "agent", true, &mut out);
     scan_md_files(&base.join("agents.paused"), "agent", false, &mut out);
     scan_md_files(&base.join("commands"), "command", true, &mut out);
     scan_md_files(&base.join("commands.paused"), "command", false, &mut out);
-    scan_plugins(&base, &mut out);
+    scan_plugins(base, &mut out);
 
     // warnings
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
@@ -207,23 +222,24 @@ pub fn inventory() -> Vec<InvItem> {
     out
 }
 
-/// Only paths inside ~/.claude may be touched by the actions below.
-fn guard(path: &str) -> Result<PathBuf, String> {
-    let base = claude_dir().ok_or("no home dir")?;
-    let p = PathBuf::from(path);
-    let canon = p.canonicalize().map_err(|e| format!("{path}: {e}"))?;
-    let base = base.canonicalize().map_err(|e| e.to_string())?;
-    if !canon.starts_with(&base) {
-        return Err("refusing to touch a path outside ~/.claude".into());
+/// Only paths inside an account's config dir may be touched by the actions
+/// below. Returns (canonical path, that account dir).
+fn guard(path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let canon = PathBuf::from(path).canonicalize().map_err(|e| format!("{path}: {e}"))?;
+    for base in account_dirs() {
+        if let Ok(b) = base.canonicalize() {
+            if canon.starts_with(&b) {
+                return Ok((canon, b));
+            }
+        }
     }
-    Ok(canon)
+    Err("refusing to touch a path outside the Claude config folders".into())
 }
 
 /// Pause (enable=false) or resume (enable=true) a user skill/agent/command.
 /// Returns the new root path.
 pub fn set_enabled(root: &str, kind: &str, enable: bool) -> Result<String, String> {
-    let src = guard(root)?;
-    let base = claude_dir().ok_or("no home dir")?;
+    let (src, base) = guard(root)?;
     let folder = match kind {
         "skill" => "skills",
         "agent" => "agents",
@@ -245,7 +261,7 @@ pub fn set_enabled(root: &str, kind: &str, enable: bool) -> Result<String, Strin
 /// is copied to ~/.claude/.tokenscope-backup first. The new value is written as
 /// a JSON string, which is a valid YAML double-quoted scalar.
 pub fn set_description(file: &str, text: &str) -> Result<(), String> {
-    let p = guard(file)?;
+    let (p, base) = guard(file)?;
     let orig = fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let lines: Vec<&str> = orig.lines().collect();
     if lines.first().map(|l| l.trim()) != Some("---") {
@@ -283,7 +299,7 @@ pub fn set_description(file: &str, text: &str) -> Result<(), String> {
         new_text.push('\n');
     }
     // backup
-    if let Some(base) = claude_dir() {
+    {
         let bdir = base.join(".tokenscope-backup");
         let _ = fs::create_dir_all(&bdir);
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -296,7 +312,7 @@ pub fn set_description(file: &str, text: &str) -> Result<(), String> {
 
 /// Open a file with the default app, or reveal it in Finder.
 pub fn open_path(path: &str, reveal: bool) -> Result<(), String> {
-    let p = guard(path)?;
+    let (p, _) = guard(path)?;
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = std::process::Command::new("open");

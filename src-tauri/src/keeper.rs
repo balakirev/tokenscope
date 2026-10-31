@@ -60,6 +60,9 @@ pub struct HotSession {
     pub last_ms: i64,
     pub hot: bool,
     pub reason: String,
+    /// account config dir this session belongs to
+    #[serde(rename = "configDir")]
+    pub config_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -73,6 +76,13 @@ pub struct Keeper {
     /// name → runs in the last 30 days (for "never runs" flags)
     #[serde(rename = "runs30d")]
     pub runs_30d: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountView {
+    #[serde(flatten)]
+    pub account: crate::accounts::Account,
+    pub keeper: Keeper,
 }
 
 /// Thresholds for the "expensive session" alert.
@@ -107,7 +117,9 @@ fn short_skill(s: &str) -> String {
     s.rsplit(':').next().unwrap_or(s).to_string()
 }
 
-pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, SessionInfo>, user_commands: &HashSet<String>) -> Keeper {
+/// `acct`: Some(config dir) → only that account's events; None → all accounts.
+pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, SessionInfo>, user_commands: &HashSet<String>, acct: Option<&str>) -> Keeper {
+    let keep = |e: &RawEvent| acct.map(|a| e.acct == a).unwrap_or(true);
     let now = Local::now();
     let now_ms = now.timestamp_millis();
     let horizon = now_ms - 31 * 86_400_000;
@@ -116,7 +128,7 @@ pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, 
     // value: (ts, skill name, kind) sorted by ts
     let mut turn_skills: HashMap<(&str, &str), Vec<(i64, String, &'static str)>> = HashMap::new();
     let mut last_used: HashMap<String, i64> = HashMap::new();
-    for e in events {
+    for e in events.iter().filter(|e| keep(e)) {
         if !e.agent.is_empty() && e.agent != "subagent" {
             let l = last_used.entry(e.agent.clone()).or_default();
             *l = (*l).max(e.ts_ms);
@@ -154,7 +166,7 @@ pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, 
     // ── per-event attribution (window-independent) ──
     let mut attrs: Vec<(usize, f64, f64, Vec<Attr>)> = Vec::new(); // (event idx, tokens, cost, attrs)
     for (i, e) in events.iter().enumerate() {
-        if e.ts_ms < horizon {
+        if e.ts_ms < horizon || !keep(e) {
             continue;
         }
         let tok = total(e);
@@ -363,6 +375,7 @@ pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, 
                 last_ms: s.last,
                 hot: live && !reasons.is_empty(),
                 reason: reasons.join(" · "),
+                config_dir: if info.acct.is_empty() { events_acct(events, sid) } else { info.acct.clone() },
             }
         })
         .collect();
@@ -371,6 +384,10 @@ pub fn build(events: &[RawEvent], pricing: &Pricing, sessions: &HashMap<String, 
     let alert = hot.iter().any(|h| h.hot);
 
     Keeper { windows, sessions: hot, alert, last_used, runs_30d }
+}
+
+fn events_acct(events: &[RawEvent], sid: &str) -> String {
+    events.iter().rev().find(|e| e.session == sid).map(|e| e.acct.clone()).unwrap_or_default()
 }
 
 fn fmt_k(t: f64) -> String {
@@ -415,6 +432,7 @@ mod tests {
             tools: tools.iter().map(|s| s.to_string()).collect(),
             agent: agent.into(),
             turn: turn.into(),
+            acct: "a".into(),
         }
     }
 
@@ -429,7 +447,7 @@ mod tests {
             ev(now - 2000, "t2", &["Read"], &[], "", m, 100.0),
             ev(now - 1000, "t9", &["Read"], &[], "Explore", m, 50.0),
         ];
-        let k = build(&events, &Pricing::shared(), &HashMap::new(), &HashSet::new());
+        let k = build(&events, &Pricing::shared(), &HashMap::new(), &HashSet::new(), None);
         let w = &k.windows[0];
         let get = |n: &str, kind: &str| w.items.iter().find(|i| i.name == n && i.kind == kind).map(|i| i.tokens).unwrap_or(-1.0);
         assert_eq!(get("Edit", "tool"), 500.0);

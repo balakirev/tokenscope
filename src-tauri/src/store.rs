@@ -44,6 +44,9 @@ pub struct RawEvent {
     // carry it, so it's inherited from the last user line in the same file).
     #[serde(default)]
     pub turn: String,
+    // Account = Claude config dir the log came from (v6).
+    #[serde(default)]
+    pub acct: String,
 }
 
 /// Per-session facts for the "hot sessions" list (cwd + title).
@@ -55,6 +58,8 @@ pub struct SessionInfo {
     pub title: String,
     #[serde(default)]
     pub custom_title: bool,
+    #[serde(default)]
+    pub acct: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -85,7 +90,8 @@ pub struct Store {
 //       tool_use line were deduped, dropping the tool call).
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: keeper facts — every tool name, subagent type, turn (promptId), sessions.
-const STORE_VERSION: u32 = 5;
+//   v6: multiple accounts (config dirs); events carry their account dir.
+const STORE_VERSION: u32 = 6;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -96,8 +102,15 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-fn projects_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude").join("projects"))
+/// (account dir, its projects/ folder) for every known account.
+fn project_roots() -> Vec<(String, PathBuf)> {
+    crate::accounts::accounts()
+        .into_iter()
+        .map(|a| {
+            let p = PathBuf::from(&a.dir).join("projects");
+            (a.dir, p)
+        })
+        .collect()
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -217,15 +230,19 @@ impl Store {
     /// so the caller can skip a full cache rewrite when nothing moved.
     pub fn ingest(&mut self) -> bool {
         let mut dirty = false;
-        let Some(root) = projects_dir() else {
-            return false;
-        };
-        for entry in WalkDir::new(&root)
+        let files: Vec<(String, PathBuf)> = project_roots()
             .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-        {
-            let path = entry.path();
+            .flat_map(|(acct, root)| {
+                WalkDir::new(&root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                    .map(move |e| (acct.clone(), e.into_path()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (acct, path_buf) in files {
+            let path = path_buf.as_path();
             let key = path.to_string_lossy().to_string();
             let Ok(meta) = fs::metadata(path) else { continue };
             let size = meta.len();
@@ -276,7 +293,7 @@ impl Store {
                 }
                 let Ok(s) = std::str::from_utf8(line) else { continue };
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { continue };
-                self.note_session(&v);
+                self.note_session(&v, &acct);
                 let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if ty == "user" {
                     if let Some(p) = v.get("promptId").and_then(|p| p.as_str()) {
@@ -286,6 +303,7 @@ impl Store {
                 if let Some(mut ev) = parse_value(&v) {
                     ev.source = key.clone();
                     ev.turn = cur_turn.clone();
+                    ev.acct = acct.clone();
                     ev.agent = if !agent.is_empty() {
                         agent.clone()
                     } else if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
@@ -321,13 +339,16 @@ impl Store {
 
 impl Store {
     /// Remember cwd / title per session (ai-title, custom-title lines).
-    fn note_session(&mut self, v: &serde_json::Value) {
+    fn note_session(&mut self, v: &serde_json::Value, acct: &str) {
         let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) else { return };
         if sid.is_empty() {
             return;
         }
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let info = self.sessions.entry(sid.to_string()).or_default();
+        if info.acct.is_empty() {
+            info.acct = acct.to_string();
+        }
         if info.cwd.is_empty() {
             if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
                 info.cwd = c.to_string();
@@ -430,6 +451,7 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         tools: Vec::new(),
         agent: String::new(),
         turn: String::new(),
+        acct: String::new(),
     })
 }
 
@@ -503,5 +525,6 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         tools,
         agent: String::new(),
         turn: String::new(),
+        acct: String::new(),
     })
 }

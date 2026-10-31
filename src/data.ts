@@ -21,20 +21,22 @@ export interface KeeperWindow {
 }
 export interface HotSession {
   session: string; project: string; cwd: string; title: string; context: number;
-  tokens5h: number; cost5h: number; lastMs: number; hot: boolean; reason: string;
+  tokens5h: number; cost5h: number; lastMs: number; hot: boolean; reason: string; configDir: string;
 }
+export interface AccountView { name: string; dir: string; isDefault: boolean; keeper: Keeper }
 export interface Keeper {
   windows: KeeperWindow[]; sessions: HotSession[]; alert: boolean;
   lastUsed: Record<string, number>; runs30d: Record<string, number>;
 }
 export interface InvItem {
   name: string; description: string; kind: "skill" | "agent" | "command"; scope: "user" | "plugin";
-  plugin: string; enabled: boolean; file: string; root: string; editable: boolean; descLen: number; warnings: string[];
+  plugin: string; enabled: boolean; file: string; root: string; editable: boolean; descLen: number; warnings: string[]; account: string;
 }
 export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
   keeper?: Keeper;
+  accounts?: AccountView[];
 }
 
 export const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;

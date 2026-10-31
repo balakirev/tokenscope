@@ -105,7 +105,22 @@ pub fn build_dashboard() -> Dashboard {
         .filter(|i| i.kind == "command")
         .map(|i| i.name)
         .collect();
-    let keeper = crate::keeper::build(&store.events, &pricing, &store.sessions, &user_commands);
+    let keeper = crate::keeper::build(&store.events, &pricing, &store.sessions, &user_commands, None);
+    let accounts = crate::accounts::accounts();
+    let account_views: Vec<crate::keeper::AccountView> = if accounts.len() > 1 {
+        accounts
+            .into_iter()
+            .map(|a| crate::keeper::AccountView {
+                keeper: crate::keeper::build(&store.events, &pricing, &store.sessions, &user_commands, Some(&a.dir)),
+                account: a,
+            })
+            .collect()
+    } else {
+        accounts
+            .into_iter()
+            .map(|a| crate::keeper::AccountView { keeper: crate::keeper::Keeper::default(), account: a })
+            .collect()
+    };
 
     let mut day = report_day(&events, now);
     let mut week = report_week(&events, now);
@@ -136,6 +151,7 @@ pub fn build_dashboard() -> Dashboard {
         today_tokens,
         generated_at: now.to_rfc3339(),
         keeper,
+        accounts: account_views,
     }
 }
 

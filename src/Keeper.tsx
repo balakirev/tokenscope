@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Dashboard, HotSession, InvItem, ItemKind, Keeper, KeeperItem, KeeperWindow, fetchInventory, fmtMoney, inTauri } from "./data";
+import { AccountView, Dashboard, HotSession, InvItem, ItemKind, Keeper, KeeperItem, KeeperWindow, fetchInventory, fmtMoney, inTauri } from "./data";
 
 // ── theme ─────────────────────────────────────────────────────────
 interface KT {
@@ -221,7 +221,7 @@ function UsageTab({ keeper, k, onOpenItem, toast }: { keeper: Keeper; k: KT; onO
 
 // ── skills tab ────────────────────────────────────────────────────
 type SFilter = "all" | "active" | "paused" | "unused" | "issues";
-function SkillsTab({ inv, keeper, k, onOpen, onToggle, busy }: { inv: InvItem[]; keeper: Keeper; k: KT; onOpen: (it: InvItem) => void; onToggle: (it: InvItem) => void; busy: string | null }) {
+function SkillsTab({ inv, keeper, k, onOpen, onToggle, busy, acctName }: { inv: InvItem[]; keeper: Keeper; k: KT; onOpen: (it: InvItem) => void; onToggle: (it: InvItem) => void; busy: string | null; acctName?: (dir: string) => string | undefined }) {
   const [q, setQ] = useState("");
   const [f, setF] = useState<SFilter>("all");
   const rows = inv.filter((it) => {
@@ -266,6 +266,7 @@ function SkillsTab({ inv, keeper, k, onOpen, onToggle, busy }: { inv: InvItem[];
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
                       <span style={{ font: `500 12.5px ${k.ui}`, color: k.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.name}</span>
+                      {acctName?.(it.account) && <span style={{ font: `500 10px ${k.ui}`, color: k.dim, border: `1px solid ${k.line}`, borderRadius: 4, padding: "0 4px" }}>{acctName(it.account)}</span>}
                       {it.scope === "plugin" && <span style={{ font: `400 10.5px ${k.ui}`, color: k.faint, whiteSpace: "nowrap" }}>{it.plugin}</span>}
                       {it.warnings.length > 0 && <span title={it.warnings.join("\n")} style={{ color: k.amber, font: `600 11px ${k.ui}` }}>⚠</span>}
                     </div>
@@ -302,7 +303,8 @@ function Toggle({ on, onChange, k, disabled, title }: { on: boolean; onChange: (
 }
 
 // ── sessions tab ──────────────────────────────────────────────────
-function SessionsTab({ sessions, k, toast }: { sessions: HotSession[]; k: KT; toast: (m: string) => void }) {
+function SessionsTab({ sessions, k, toast, accounts }: { sessions: HotSession[]; k: KT; toast: (m: string) => void; accounts: AccountView[] }) {
+  const acctOf = (dir: string) => accounts.find((a) => a.dir === dir);
   return (
     <div className="om-scroll" style={{ flex: 1, overflowY: "auto", minHeight: 0, paddingTop: 6 }}>
       <div style={{ padding: "4px 14px 8px", font: `400 11px ${k.ui}`, color: k.dim }}>
@@ -312,7 +314,9 @@ function SessionsTab({ sessions, k, toast }: { sessions: HotSession[]; k: KT; to
       {sessions.map((s) => (
         <div key={s.session} className="kp-row"
           onClick={async () => {
-            const cmd = (s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : "") + `claude --resume ${s.session}`;
+            const acct = acctOf(s.configDir);
+            const env = acct && !acct.isDefault ? `CLAUDE_CONFIG_DIR=${JSON.stringify(acct.dir)} ` : "";
+            const cmd = (s.cwd ? `cd ${JSON.stringify(s.cwd)} && ` : "") + `${env}claude --resume ${s.session}`;
             if (await copy(cmd)) toast("Resume command copied");
           }}
           title={`${s.cwd}\n${s.session}`}
@@ -324,7 +328,10 @@ function SessionsTab({ sessions, k, toast }: { sessions: HotSession[]; k: KT; to
             <span style={{ font: `500 12px ${k.mono}`, color: s.hot ? k.amber : k.green, flexShrink: 0 }}>{fmtTok(s.context)} ctx</span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, font: `400 10.5px ${k.mono}`, color: k.dim }}>
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.project} · {ago(s.lastMs)}</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {accounts.length > 1 && acctOf(s.configDir) && <span style={{ color: k.text }}>{acctOf(s.configDir)!.name} · </span>}
+              {s.project} · {ago(s.lastMs)}
+            </span>
             <span style={{ flexShrink: 0 }}>{fmtTok(s.tokens5h)} · {fmtMoney(s.cost5h)} / 5h</span>
           </div>
           {s.hot && <div style={{ marginTop: 3, font: `500 10.5px ${k.ui}`, color: k.amber }}>⚠ {s.reason}</div>}
@@ -432,8 +439,19 @@ export function KeeperShell({ dash, dark, tab, setTab, openGen, children }: {
   dash: Dashboard; dark: boolean; tab: KTab; setTab: (t: KTab) => void; openGen: number; children?: React.ReactNode;
 }) {
   const k = KTH[dark ? "dark" : "light"];
-  const keeper = dash.keeper;
-  const [inv, setInv] = useState<InvItem[]>([]);
+  const accounts = dash.accounts ?? [];
+  const multi = accounts.length > 1;
+  const [acct, setAcct] = useState<string>(() => { try { return localStorage.getItem("kp-acct") || "all"; } catch { return "all"; } });
+  const cur = multi && acct !== "all" ? accounts.find((a) => a.dir === acct) : undefined;
+  const keeper = cur ? cur.keeper : dash.keeper;
+  const pickAcct = (v: string) => { setAcct(v); lsSet("kp-acct", v); };
+  const [pinned, setPinned] = useState<boolean>(() => { try { return localStorage.getItem("kp-pinned") === "1"; } catch { return false; } });
+  useEffect(() => { if (inTauri()) invoke("set_pinned", { pinned }).catch(() => {}); }, [pinned]);
+  const togglePin = () => setPinned((p) => { lsSet("kp-pinned", p ? "0" : "1"); return !p; });
+  const [invAll, setInv] = useState<InvItem[]>([]);
+  // In "All" mode with several accounts, skills are listed per account; the
+  // selector narrows to one. Single account → everything.
+  const inv = cur ? invAll.filter((i) => i.account === cur.dir) : invAll;
   const [sel, setSel] = useState<{ name: string; kind: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
@@ -460,36 +478,67 @@ export function KeeperShell({ dash, dark, tab, setTab, openGen, children }: {
   const hotCount = keeper?.sessions.filter((s) => s.hot).length ?? 0;
   const tabs: { key: KTab; label: string }[] = [
     { key: "usage", label: "Usage" }, { key: "skills", label: "Skills" },
-    { key: "sessions", label: hotCount ? `Sessions ⚠${hotCount}` : "Sessions" }, { key: "charts", label: "Charts" },
+    { key: "sessions", label: hotCount ? `Sessions·${hotCount}` : "Sessions" }, { key: "charts", label: "Charts" },
   ];
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: k.card, color: k.text,
       borderRadius: 12, border: `1px solid ${k.line}`, overflow: "hidden", position: "relative", fontFamily: k.ui }}>
       <style>{`.kp-row:hover{background:${k.hover}}`}</style>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 14px 9px", borderBottom: `1px solid ${k.line}` }}>
-        <Bolt color={keeper?.alert ? k.amber : k.green} />
-        <span style={{ font: `600 13px ${k.ui}` }}>Tokenscope</span>
+      <div
+        onMouseDown={(e) => {
+          if (!pinned || e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+          invoke("begin_drag").catch(() => {});
+        }}
+        style={{ display: "flex", alignItems: "center", gap: 8, padding: "11px 10px 9px 14px", borderBottom: multi ? "none" : `1px solid ${k.line}`, cursor: pinned ? "grab" : "default" }}>
+        <Bolt color={dash.keeper?.alert ? k.amber : k.green} />
+        <span style={{ font: `600 13px ${k.ui}`, whiteSpace: "nowrap" }}>Tokenscope</span>
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", gap: 2 }}>
           {tabs.map((t) => (
             <button key={t.key} onClick={() => setTab(t.key)} style={{
-              border: 0, borderRadius: 6, padding: "3px 8px", cursor: "pointer",
+              border: 0, borderRadius: 6, padding: "3px 6px", cursor: "pointer", whiteSpace: "nowrap",
               font: `${tab === t.key ? 600 : 500} 11.5px ${k.ui}`,
               background: tab === t.key ? k.segOn : "transparent",
               color: t.key === "sessions" && hotCount ? k.amber : tab === t.key ? k.text : k.dim,
             }}>{t.label}</button>
           ))}
         </div>
+        <button onClick={togglePin} title={pinned ? "Unpin — hide when clicking elsewhere" : "Pin — keep the panel on screen; drag it by this header"}
+          style={{ border: 0, borderRadius: 6, width: 24, height: 22, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+            background: pinned ? k.segOn : "transparent", color: pinned ? k.green : k.dim }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden fill="currentColor">
+            <path d="M16 3a1 1 0 0 1 .7 1.7L15.4 6l2.6 5.2 1.3-1.3a1 1 0 0 1 1.4 1.4l-3.3 3.3-1.4-1.4-2.3 2.3V20a1 1 0 0 1-1.7.7L9 17.4l-4.3 4.3a1 1 0 0 1-1.4-1.4L7.6 16l-3.3-3a1 1 0 0 1 .7-1.7h4.5l2.3-2.3L10.4 7.6l3.3-3.3A1 1 0 0 1 16 3z" />
+          </svg>
+        </button>
       </div>
+      {multi && (
+        <div style={{ display: "flex", gap: 4, padding: "0 14px 8px", borderBottom: `1px solid ${k.line}`, flexWrap: "wrap" }}>
+          {[{ dir: "all", name: "All", tok: dash.keeper?.windows.find((w) => w.key === "24h")?.totalTokens ?? 0, alert: dash.keeper?.alert },
+            ...accounts.map((a) => ({ dir: a.dir, name: a.name, tok: a.keeper.windows.find((w) => w.key === "24h")?.totalTokens ?? 0, alert: a.keeper.alert }))]
+            .map((a) => {
+              const on = (acct === "all" && a.dir === "all") || acct === a.dir;
+              return (
+                <button key={a.dir} onClick={() => pickAcct(a.dir)} title={a.dir === "all" ? "All accounts" : a.dir}
+                  style={{ border: `1px solid ${on ? "transparent" : k.line}`, borderRadius: 999, padding: "2px 9px", cursor: "pointer",
+                    background: on ? k.segOn : "transparent", color: on ? k.text : k.dim, font: `${on ? 600 : 500} 11px ${k.ui}`,
+                    display: "flex", alignItems: "center", gap: 5 }}>
+                  {a.alert && <span style={{ width: 6, height: 6, borderRadius: 3, background: k.amber }} />}
+                  {a.name}
+                  <span style={{ font: `400 10px ${k.mono}`, color: k.faint }}>{fmtTok(a.tok)}</span>
+                </button>
+              );
+            })}
+        </div>
+      )}
       {!keeper && tab !== "charts" ? (
         <div style={{ padding: 24, font: `400 12px ${k.ui}`, color: k.dim }}>No data yet.</div>
       ) : tab === "usage" ? (
         <UsageTab keeper={keeper!} k={k} toast={toast} onOpenItem={(name, kind) => setSel({ name, kind })} />
       ) : tab === "skills" ? (
-        <SkillsTab inv={inv} keeper={keeper!} k={k} busy={busy} onToggle={toggle} onOpen={(it) => setSel({ name: it.name, kind: it.kind })} />
+        <SkillsTab inv={inv} keeper={keeper!} k={k} busy={busy} acctName={multi && !cur ? (d) => accounts.find((a) => a.dir === d)?.name : undefined} onToggle={toggle} onOpen={(it) => setSel({ name: it.name, kind: it.kind })} />
       ) : tab === "sessions" ? (
-        <SessionsTab sessions={keeper!.sessions} k={k} toast={toast} />
+        <SessionsTab sessions={keeper!.sessions} k={k} toast={toast} accounts={accounts} />
       ) : (
         <div style={{ flex: 1, minHeight: 0 }}>{children}</div>
       )}

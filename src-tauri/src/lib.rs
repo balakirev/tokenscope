@@ -1,3 +1,4 @@
+mod accounts;
 mod config;
 mod keeper;
 mod model;
@@ -363,13 +364,20 @@ fn begin_drag(window: tauri::Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
-/// macOS uses a menu-bar NSPanel that isn't user-draggable, so begin_drag is a
-/// no-op there. It's also never invoked (the frontend gates it out) — this just
-/// keeps the shared invoke_handler list valid and guarantees zero macOS effect.
+/// Pinned = the panel stays on screen (no hide on click-outside, app switch or
+/// Space change), floats above other windows on every Space, and can be dragged
+/// by its header. Toggled from the pin button in the panel.
+static PINNED: AtomicBool = AtomicBool::new(false);
+
+/// macOS: the menu-bar NSPanel is only draggable while pinned (otherwise it is a
+/// popover anchored under the tray icon).
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn begin_drag(_window: tauri::Window) -> Result<(), String> {
-    Ok(())
+fn begin_drag(window: tauri::Window) -> Result<(), String> {
+    if !PINNED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    window.start_dragging().map_err(|e| e.to_string())
 }
 
 /// Anchor the panel under the tray icon, top flush with the menu-bar bottom:
@@ -529,7 +537,7 @@ fn app_is_frontmost() -> bool {
 /// Spaces and can stay key across the transition.
 #[cfg(target_os = "macos")]
 fn hide_panel_on_context_switch(app: &tauri::AppHandle) {
-    if app_is_frontmost() {
+    if PINNED.load(Ordering::Relaxed) || app_is_frontmost() {
         return;
     }
     if let Ok(panel) = app.get_webview_panel("main") {
@@ -681,6 +689,29 @@ async fn get_inventory() -> Vec<skills::InvItem> {
 }
 
 #[tauri::command]
+fn set_pinned(app: tauri::AppHandle, pinned: bool) {
+    PINNED.store(pinned, Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    if let Ok(panel) = app.get_webview_panel("main") {
+        use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior as B;
+        // Pinned: live on every Space so it stays in view while you switch
+        // desktops. Unpinned: the original popover behaviour.
+        panel.set_collection_behaviour(if pinned {
+            B::NSWindowCollectionBehaviorCanJoinAllSpaces | B::NSWindowCollectionBehaviorFullScreenAuxiliary
+        } else {
+            B::NSWindowCollectionBehaviorMoveToActiveSpace | B::NSWindowCollectionBehaviorFullScreenAuxiliary
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = &app; // window already always-on-top (tauri.conf.json)
+}
+
+#[tauri::command]
+fn get_accounts() -> Vec<accounts::Account> {
+    accounts::accounts()
+}
+
+#[tauri::command]
 fn toggle_item(root: String, kind: String, enable: bool) -> Result<String, String> {
     skills::set_enabled(&root, &kind, enable)
 }
@@ -827,6 +858,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
             get_inventory,
+            get_accounts,
+            set_pinned,
             toggle_item,
             open_item,
             set_item_description,
@@ -880,6 +913,9 @@ pub fn run() {
                 });
                 delegate.set_listener(Box::new(move |name: String| {
                     if name == "window_did_resign_key" {
+                        if PINNED.load(Ordering::Relaxed) {
+                            return;
+                        }
                         lh.store(now_ms(), Ordering::Relaxed);
                         if let Ok(panel) = handle.get_webview_panel("main") {
                             panel.order_out(None);
@@ -936,7 +972,7 @@ pub fn run() {
                         // VISIBLE popover the user clicks away from should be saved
                         // and hidden. Without this, startup persisted the OS's
                         // default placement and every open snapped there.
-                        if !w.is_visible().unwrap_or(false) {
+                        if !w.is_visible().unwrap_or(false) || PINNED.load(Ordering::Relaxed) {
                             return;
                         }
                         // A title-bar drag momentarily blurs the window (the OS
